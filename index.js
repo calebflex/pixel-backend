@@ -71,7 +71,7 @@ app.post('/api/user/save', (req, res) => {
   }
 });
 
-// SECURE ADMIN GRANT ENDPOINT
+// SECURE ADMIN GRANT ENDPOINT (Fully handles array and object client formats)
 app.post('/api/admin/grant-player', (req, res) => {
   const { username, player, adminKey } = req.body;
   if (adminKey !== 'MY_SECRET_OWNER_KEY_123') {
@@ -84,9 +84,28 @@ app.post('/api/admin/grant-player', (req, res) => {
       db.prepare('INSERT INTO users (username, squad, settings) VALUES (?, ?, ?)').run(username, '[]', '{}');
       user = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
     }
-    let squad = JSON.parse(user.squad || '[]');
-    if (!squad.some(p => p.id === player.id)) squad.push(player);
-    db.prepare('UPDATE users SET squad = ? WHERE username = ?').run(JSON.stringify(squad), username);
+
+    let squadData;
+    try {
+      squadData = JSON.parse(user.squad || '[]');
+    } catch(e) {
+      squadData = [];
+    }
+
+    // Support both client object payload format ({ owned: [...], lineup: [...] }) and raw arrays
+    if (!Array.isArray(squadData) && squadData !== null && typeof squadData === 'object') {
+      if (!Array.isArray(squadData.owned)) squadData.owned = [];
+      if (!squadData.owned.some(p => p.id === player.id)) {
+        squadData.owned.push(player);
+      }
+    } else {
+      if (!Array.isArray(squadData)) squadData = [];
+      if (!squadData.some(p => p.id === player.id)) {
+        squadData.push(player);
+      }
+    }
+
+    db.prepare('UPDATE users SET squad = ? WHERE username = ?').run(JSON.stringify(squadData), username);
     res.json({ success: true, message: `Granted ${player.name} to ${username}` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
