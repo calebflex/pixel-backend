@@ -71,6 +71,28 @@ app.post('/api/user/save', (req, res) => {
   }
 });
 
+// SECURE ADMIN GRANT ENDPOINT
+app.post('/api/admin/grant-player', (req, res) => {
+  const { username, player, adminKey } = req.body;
+  if (adminKey !== 'MY_SECRET_OWNER_KEY_123') {
+    return res.status(403).json({ success: false, error: 'Unauthorized: Wrong admin key' });
+  }
+  if (!username || !player) return res.status(400).json({ success: false, error: 'Username and player required' });
+  try {
+    let user = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
+    if (!user) {
+      db.prepare('INSERT INTO users (username, squad, settings) VALUES (?, ?, ?)').run(username, '[]', '{}');
+      user = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
+    }
+    let squad = JSON.parse(user.squad || '[]');
+    if (!squad.some(p => p.id === player.id)) squad.push(player);
+    db.prepare('UPDATE users SET squad = ? WHERE username = ?').run(JSON.stringify(squad), username);
+    res.json({ success: true, message: `Granted ${player.name} to ${username}` });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is running and listening permanently on port ${PORT}`);
