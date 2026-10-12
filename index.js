@@ -29,8 +29,13 @@ app.get('/api/user/:username', (req, res) => {
       db.prepare('INSERT INTO users (username, squad, settings) VALUES (?, ?, ?)').run(username, '[]', '{}');
       user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
     }
+    
     let squadParsed = [];
-    try { squadParsed = JSON.parse(user.squad); } catch(e) {}
+    try { 
+      let rawSquad = JSON.parse(user.squad);
+      squadParsed = Array.isArray(rawSquad) ? rawSquad : (rawSquad.owned || []);
+    } catch(e) {}
+
     let settingsParsed = {};
     try { settingsParsed = JSON.parse(user.settings); } catch(e) {}
 
