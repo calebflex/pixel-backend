@@ -69,14 +69,21 @@ app.post('/api/user/save', (req, res) => {
     const existing = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
     let finalSquad = squad || [];
 
-    // Safeguard: If the server database contains rich player objects (from admin grants), 
-    // never let an incoming client sync wipe them out with basic ID arrays.
     if (existing && existing.squad) {
       try {
         let dbSquad = JSON.parse(existing.squad);
         let dbList = Array.isArray(dbSquad) ? dbSquad : (dbSquad.owned || []);
+        let clientList = Array.isArray(squad) ? squad : (squad?.owned || []);
+
+        // Bulletproof merge: if the server database has full admin player objects, keep them alongside client items
         if (dbList.length > 0 && typeof dbList[0] === 'object') {
-          finalSquad = dbSquad;
+          const map = new Map();
+          dbList.forEach(p => { if (p && p.id) map.set(p.id, p); });
+          clientList.forEach(p => { 
+            if (p && typeof p === 'object' && p.id) map.set(p.id, p); 
+          });
+          const combined = Array.from(map.values());
+          finalSquad = Array.isArray(squad) ? combined : { ...(squad || {}), owned: combined };
         }
       } catch(e) {}
     }
@@ -108,10 +115,12 @@ app.post('/api/admin/grant-player', (req, res) => {
     try { squadData = JSON.parse(user.squad || '[]'); } catch(e) { squadData = []; }
 
     if (Array.isArray(squadData)) {
-      if (!squadData.some(p => p && p.id === player.id)) squadData.push(player);
+      const idx = squadData.findIndex(p => p && p.id === player.id);
+      if (idx >= 0) squadData[idx] = player; else squadData.push(player);
     } else if (squadData && typeof squadData === 'object') {
       if (!Array.isArray(squadData.owned)) squadData.owned = [];
-      if (!squadData.owned.some(p => p && p.id === player.id)) squadData.owned.push(player);
+      const idx = squadData.owned.findIndex(p => p && p.id === player.id);
+      if (idx >= 0) squadData.owned[idx] = player; else squadData.owned.push(player);
     }
 
     db.prepare('UPDATE users SET squad = ? WHERE username = ?').run(JSON.stringify(squadData), username);
@@ -125,4 +134,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server is running and listening permanently on port ${PORT}`);
 });
-
