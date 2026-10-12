@@ -1,21 +1,88 @@
 const express = require('express');
 const cors = require('cors');
-const db = require('./database');
+const path = require('path');
+const Database = require('better-sqlite3');
 
 console.log('Starting Poxel FC 27 Database Server...');
 
+// ---- config (set these in Render > Environment) ----
+const ADMIN_KEY = process.env.ADMIN_KEY || '';          // REQUIRED for admin grants
+const DB_PATH = process.env.DB_PATH || 'poxel_fc27.db'; // point at a Render Disk (e.g. /data/poxel_fc27.db) so data survives restarts
+const NUM = ['level', 'xp', 'coins', 'gems', 'tokens', 'trophies'];
+
+let ROSTER = [];
+try { ROSTER = require('./roster.json'); } catch (e) { console.warn('roster.json missing: players can only be granted by numeric id'); }
+
+let db;
+try {
+  db = new Database(DB_PATH);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT UNIQUE NOT NULL,
+      level INTEGER DEFAULT 1,
+      xp INTEGER DEFAULT 0,
+      coins INTEGER DEFAULT 25000,
+      gems INTEGER DEFAULT 450,
+      trophies INTEGER DEFAULT 0,
+      squad TEXT DEFAULT '[]',
+      settings TEXT DEFAULT '{}',
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  // migrations for older databases
+  const cols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+  if (!cols.includes('tokens')) db.exec('ALTER TABLE users ADD COLUMN tokens INTEGER DEFAULT 0');
+  if (!cols.includes('pending')) db.exec("ALTER TABLE users ADD COLUMN pending TEXT DEFAULT '{}'");
+  console.log('SQLite database initialized successfully at', DB_PATH);
+} catch (err) {
+  console.error('Database initialization failed:', err);
+  process.exit(1);
+}
+
+const jparse = (s, d) => { try { const v = JSON.parse(s); return v && typeof v === 'object' ? v : d; } catch (e) { return d; } };
+const num = v => { const n = Number(v); return Number.isFinite(n) ? Math.trunc(n) : null; };
+
+/* squad is stored as { owned:[playerIds], lineup:[playerIds], clubName } (what the game sends).
+   Old rows may hold '[]' or objects - normalise to ids. */
+function readSquad(raw) {
+  let sq = jparse(raw, {});
+  if (Array.isArray(sq)) sq = {};
+  const ids = (sq.owned || []).map(x => (x && typeof x === 'object' ? num(x.id) : num(x))).filter(x => x !== null);
+  return { owned: [...new Set(ids)], lineup: Array.isArray(sq.lineup) ? sq.lineup : [], clubName: sq.clubName || 'Poxel FC' };
+}
+
+const pendingEmpty = p => !p || (!Object.keys(p.add || {}).length && !Object.keys(p.set || {}).length && !(p.players || []).length);
+
+/* Admin grants are stored as "pending" and merged the next time the player loads or saves.
+   This is what stops the game's 30s auto-save from overwriting your grant with the player's old numbers. */
+function applyPending(values, squad, pending) {
+  if (pendingEmpty(pending)) return false;
+  for (const [k, v] of Object.entries(pending.set || {})) if (NUM.includes(k)) values[k] = v;
+  for (const [k, v] of Object.entries(pending.add || {})) if (NUM.includes(k)) values[k] = (values[k] || 0) + v;
+  for (const id of pending.players || []) if (!squad.owned.includes(id)) squad.owned.push(id);
+  return true;
+}
+
+const publicUser = (row, squad) => ({
+  id: row.id, username: row.username, level: row.level, xp: row.xp, coins: row.coins, gems: row.gems,
+  tokens: row.tokens || 0, trophies: row.trophies, squad, settings: jparse(row.settings, {}), updated_at: row.updated_at
+});
+
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.use(cors());
+
+app.get('/', (req, res) => res.send('Poxel FC 27 server is running'));
 
 app.post('/api/user/create', (req, res) => {
   const { username } = req.body;
   if (!username) return res.status(400).json({ success: false, error: 'Username required' });
   try {
-    const stmt = db.prepare('INSERT OR IGNORE INTO users (username, squad, settings) VALUES (?, ?, ?)');
-    stmt.run(username, JSON.stringify([]), JSON.stringify({ assist: 'full', sound: true }));
-    const user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-    res.json({ success: true, data: user });
+    db.prepare('INSERT OR IGNORE INTO users (username, squad, settings) VALUES (?, ?, ?)')
+      .run(username, JSON.stringify({ owned: [], lineup: [], clubName: 'Poxel FC' }), JSON.stringify({ assist: 'full', sound: true }));
+    const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    res.json({ success: true, data: publicUser(row, readSquad(row.squad)) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -24,96 +91,109 @@ app.post('/api/user/create', (req, res) => {
 app.get('/api/user/:username', (req, res) => {
   const { username } = req.params;
   try {
-    let user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
-    if (!user) {
-      db.prepare('INSERT INTO users (username, squad, settings) VALUES (?, ?, ?)').run(username, '[]', '{}');
-      user = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    let row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    if (!row) {
+      db.prepare('INSERT INTO users (username, squad, settings) VALUES (?, ?, ?)').run(username, '{}', '{}');
+      row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
     }
-    
-    let squadParsed = [];
-    try { 
-      let rawSquad = JSON.parse(user.squad);
-      squadParsed = Array.isArray(rawSquad) ? rawSquad : (rawSquad.owned || []);
-    } catch(e) {}
-
-    let settingsParsed = {};
-    try { settingsParsed = JSON.parse(user.settings); } catch(e) {}
-
-    res.json({ success: true, data: { ...user, squad: squadParsed, settings: settingsParsed } });
+    const squad = readSquad(row.squad);
+    const pending = jparse(row.pending, {});
+    const values = {}; NUM.forEach(k => values[k] = row[k] || 0);
+    if (applyPending(values, squad, pending)) {
+      db.prepare(`UPDATE users SET level=@level, xp=@xp, coins=@coins, gems=@gems, tokens=@tokens, trophies=@trophies,
+                  squad=@squad, pending='{}', updated_at=CURRENT_TIMESTAMP WHERE username=@username`)
+        .run({ ...values, squad: JSON.stringify(squad), username });
+      row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    }
+    res.json({ success: true, data: publicUser(row, squad) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.post('/api/user/save', (req, res) => {
-  const { username, level, xp, coins, gems, trophies, squad, settings } = req.body;
+  const { username, squad: clientSquad, settings } = req.body;
+  if (!username) return res.status(400).json({ success: false, error: 'Username required' });
   try {
-    const existing = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
-    let finalSquad = squad || [];
-
-    if (existing && existing.squad) {
-      try {
-        let dbSquad = JSON.parse(existing.squad);
-        let dbList = Array.isArray(dbSquad) ? dbSquad : (dbSquad.owned || []);
-        let clientList = Array.isArray(squad) ? squad : (squad?.owned || []);
-
-        if (dbList.length > 0 && typeof dbList[0] === 'object') {
-          const map = new Map();
-          dbList.forEach(p => { if (p && p.id) map.set(p.id, p); });
-          clientList.forEach(p => { 
-            if (p && typeof p === 'object' && p.id) map.set(p.id, p); 
-          });
-          const combined = Array.from(map.values());
-          finalSquad = Array.isArray(squad) ? combined : { ...(squad || {}), owned: combined };
-        }
-      } catch(e) {}
-    }
-
-    db.prepare(`
-      UPDATE users SET level = ?, xp = ?, coins = ?, gems = ?, trophies = ?, squad = ?, settings = ?, updated_at = CURRENT_TIMESTAMP
-      WHERE username = ?
-    `).run(level, xp, coins, gems, trophies, JSON.stringify(finalSquad), JSON.stringify(settings || {}), username);
-    res.json({ success: true });
+    const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    if (!row) return res.status(404).json({ success: false, error: 'User not found' });
+    const values = {};
+    NUM.forEach(k => { const n = num(req.body[k]); values[k] = n === null ? (row[k] || 0) : n; });
+    const squad = readSquad(JSON.stringify(clientSquad || {}));
+    applyPending(values, squad, jparse(row.pending, {}));
+    db.prepare(`UPDATE users SET level=@level, xp=@xp, coins=@coins, gems=@gems, tokens=@tokens, trophies=@trophies,
+                squad=@squad, settings=@settings, pending='{}', updated_at=CURRENT_TIMESTAMP WHERE username=@username`)
+      .run({ ...values, squad: JSON.stringify({ ...(clientSquad || {}), owned: squad.owned, lineup: squad.lineup, clubName: squad.clubName }),
+             settings: JSON.stringify(settings || {}), username });
+    const fresh = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    // returning the merged profile lets the game pick up grants immediately
+    res.json({ success: true, data: publicUser(fresh, readSquad(fresh.squad)) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.post('/api/admin/grant-player', (req, res) => {
-  const { username, player, adminKey } = req.body;
-  console.log('>>> ADMIN GRANT TRIGGERED -> Target:', username, '| Player:', player?.name);
+/* ===================== ADMIN =====================
+   Auth: header  x-admin-key: <ADMIN_KEY env var>
+   POST /api/admin/grant
+     { username, mode: "add" | "set", coins, gems, tokens, xp, level, trophies, players: [1380, "Ruud Gullit"] }
+   GET  /api/admin/players?q=rodri     -> look up player ids
+   GET  /api/admin/user/:username      -> see a player's row + pending grants */
+function requireAdmin(req, res, next) {
+  const key = req.get('x-admin-key') || '';
+  if (!ADMIN_KEY) return res.status(503).json({ success: false, error: 'ADMIN_KEY is not set on the server' });
+  if (key !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'Wrong admin key' });
+  next();
+}
 
-  if (adminKey !== 'MY_SECRET_OWNER_KEY_123') {
-    return res.status(403).json({ success: false, error: 'Unauthorized: Wrong admin key' });
-  }
-  if (!username || !player) {
-    return res.status(400).json({ success: false, error: 'Username and player required' });
-  }
+function resolvePlayer(p) {
+  const id = num(p);
+  if (id !== null && String(p).trim() !== '' && /^\d+$/.test(String(p).trim())) return ROSTER.length && !ROSTER.some(r => r.id === id) ? null : id;
+  const name = String(p).trim().toLowerCase();
+  const hit = ROSTER.find(r => r.name.toLowerCase() === name) || ROSTER.find(r => r.name.toLowerCase().includes(name));
+  return hit ? hit.id : null;
+}
 
+app.get('/api/admin/players', requireAdmin, (req, res) => {
+  const q = String(req.query.q || '').toLowerCase();
+  res.json({ success: true, data: ROSTER.filter(r => r.name.toLowerCase().includes(q)).slice(0, 50) });
+});
+
+app.get('/api/admin/user/:username', requireAdmin, (req, res) => {
+  const row = db.prepare('SELECT * FROM users WHERE username = ?').get(req.params.username);
+  if (!row) return res.status(404).json({ success: false, error: 'User not found' });
+  res.json({ success: true, data: { ...publicUser(row, readSquad(row.squad)), pending: jparse(row.pending, {}) } });
+});
+
+app.post('/api/admin/grant', requireAdmin, (req, res) => {
+  const { username, mode = 'add', players = [] } = req.body;
+  if (!username) return res.status(400).json({ success: false, error: 'username required' });
+  if (!['add', 'set'].includes(mode)) return res.status(400).json({ success: false, error: 'mode must be add or set' });
   try {
-    let user = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
-    if (!user) {
-      db.prepare('INSERT INTO users (username, squad, settings) VALUES (?, ?, ?)').run(username, '[]', '{}');
-      user = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
+    const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+    if (!row) return res.status(404).json({ success: false, error: 'User not found: ' + username });
+    const pending = jparse(row.pending, {});
+    pending.add = pending.add || {}; pending.set = pending.set || {}; pending.players = pending.players || [];
+    const applied = {};
+    for (const k of NUM) {
+      const n = num(req.body[k]);
+      if (n === null) continue;
+      if (mode === 'set') { pending.set[k] = n; delete pending.add[k]; }
+      else pending.add[k] = (pending.add[k] || 0) + n;
+      applied[k] = n;
     }
-
-    let squadData = [];
-    try { squadData = JSON.parse(user.squad || '[]'); } catch(e) { squadData = []; }
-
-    if (Array.isArray(squadData)) {
-      const idx = squadData.findIndex(p => p && p.id === player.id);
-      if (idx >= 0) squadData[idx] = player; else squadData.push(player);
-    } else if (squadData && typeof squadData === 'object') {
-      if (!Array.isArray(squadData.owned)) squadData.owned = [];
-      const idx = squadData.owned.findIndex(p => p && p.id === player.id);
-      if (idx >= 0) squadData.owned[idx] = player; else squadData.owned.push(player);
+    const granted = [], notFound = [];
+    for (const p of [].concat(players)) {
+      const id = resolvePlayer(p);
+      if (id === null) { notFound.push(p); continue; }
+      if (!pending.players.includes(id)) pending.players.push(id);
+      granted.push(id);
     }
-
-    db.prepare('UPDATE users SET squad = ? WHERE username = ?').run(JSON.stringify(squadData), username);
-    console.log('>>> SUCCESS: Granted', player.name, 'to', username);
-    res.json({ success: true, message: `Granted ${player.name} to ${username}` });
+    db.prepare('UPDATE users SET pending = ? WHERE username = ?').run(JSON.stringify(pending), username);
+    console.log(`>>> ADMIN GRANT -> ${username} | mode=${mode} | ${JSON.stringify(applied)} | players=${JSON.stringify(granted)}`);
+    res.json({ success: true, applied, players: granted, notFound,
+      note: 'Applied the next time the player opens the game or auto-saves (within ~30s if they are online).' });
   } catch (err) {
-    console.error('>>> ADMIN GRANT ERROR:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
