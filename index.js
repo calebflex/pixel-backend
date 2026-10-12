@@ -1,31 +1,8 @@
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
+const db = require('./database');
 
 console.log('Starting Poxel FC 27 Database Server...');
-
-let db;
-try {
-  db = new Database('poxel_fc27.db', { verbose: console.log });
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      level INTEGER DEFAULT 1,
-      xp INTEGER DEFAULT 0,
-      coins INTEGER DEFAULT 25000,
-      gems INTEGER DEFAULT 450,
-      trophies INTEGER DEFAULT 0,
-      squad TEXT DEFAULT '[]',
-      settings TEXT DEFAULT '{}',
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-  console.log('SQLite database initialized successfully.');
-} catch (err) {
-  console.error('Database initialization failed:', err);
-  process.exit(1);
-}
 
 const app = express();
 app.use(express.json());
@@ -102,11 +79,9 @@ app.post('/api/admin/grant-player', (req, res) => {
   console.log('>>> ADMIN GRANT TRIGGERED -> Target:', username, '| Player:', player?.name);
 
   if (adminKey !== 'MY_SECRET_OWNER_KEY_123') {
-    console.log('>>> ADMIN GRANT FAILED: Invalid adminKey');
     return res.status(403).json({ success: false, error: 'Unauthorized: Wrong admin key' });
   }
   if (!username || !player) {
-    console.log('>>> ADMIN GRANT FAILED: Missing fields');
     return res.status(400).json({ success: false, error: 'Username and player required' });
   }
 
@@ -130,7 +105,7 @@ app.post('/api/admin/grant-player', (req, res) => {
     }
 
     db.prepare('UPDATE users SET squad = ? WHERE username = ?').run(JSON.stringify(squadData), username);
-    console.log('>>> SUCCESSFULLY ADDED PLAYER TO DATABASE FOR:', username);
+    console.log('>>> SUCCESS: Granted', player.name, 'to', username);
     res.json({ success: true, message: `Granted ${player.name} to ${username}` });
   } catch (err) {
     console.error('>>> ADMIN GRANT ERROR:', err.message);
