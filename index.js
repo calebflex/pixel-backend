@@ -75,7 +75,6 @@ app.post('/api/user/save', (req, res) => {
         let dbList = Array.isArray(dbSquad) ? dbSquad : (dbSquad.owned || []);
         let clientList = Array.isArray(squad) ? squad : (squad?.owned || []);
 
-        // Bulletproof merge: if the server database has full admin player objects, keep them alongside client items
         if (dbList.length > 0 && typeof dbList[0] === 'object') {
           const map = new Map();
           dbList.forEach(p => { if (p && p.id) map.set(p.id, p); });
@@ -100,10 +99,17 @@ app.post('/api/user/save', (req, res) => {
 
 app.post('/api/admin/grant-player', (req, res) => {
   const { username, player, adminKey } = req.body;
+  console.log('>>> ADMIN GRANT TRIGGERED -> Target:', username, '| Player:', player?.name);
+
   if (adminKey !== 'MY_SECRET_OWNER_KEY_123') {
+    console.log('>>> ADMIN GRANT FAILED: Invalid adminKey');
     return res.status(403).json({ success: false, error: 'Unauthorized: Wrong admin key' });
   }
-  if (!username || !player) return res.status(400).json({ success: false, error: 'Username and player required' });
+  if (!username || !player) {
+    console.log('>>> ADMIN GRANT FAILED: Missing fields');
+    return res.status(400).json({ success: false, error: 'Username and player required' });
+  }
+
   try {
     let user = db.prepare('SELECT squad FROM users WHERE username = ?').get(username);
     if (!user) {
@@ -124,8 +130,10 @@ app.post('/api/admin/grant-player', (req, res) => {
     }
 
     db.prepare('UPDATE users SET squad = ? WHERE username = ?').run(JSON.stringify(squadData), username);
+    console.log('>>> SUCCESSFULLY ADDED PLAYER TO DATABASE FOR:', username);
     res.json({ success: true, message: `Granted ${player.name} to ${username}` });
   } catch (err) {
+    console.error('>>> ADMIN GRANT ERROR:', err.message);
     res.status(500).json({ success: false, error: err.message });
   }
 });
